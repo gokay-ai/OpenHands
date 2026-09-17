@@ -129,7 +129,7 @@ export const useCreateConversation = () => {
       // `launched_agent_profile` stamped and the profile's config applied
       // (#1571 review).
       const isCloud = backend.kind === "cloud";
-      let effectiveAgentProfileId = requestedAgentProfileId;
+      let prefersAgentSettingsFallback = false;
       // The account-wide active LLM profile from the launch-path fetch below
       // (null when that fetch didn't run or failed). Fresher than the
       // `useLlmProfiles()` render snapshot, which a fast send can outrun.
@@ -157,7 +157,7 @@ export const useCreateConversation = () => {
         //
         // Scoped to local: cloud never writes agent_settings, so it always
         // resolves `default` server-side via agent_profile_id (validated below).
-        effectiveAgentProfileId = undefined;
+        prefersAgentSettingsFallback = true;
       } else if (
         resolvedAgentProfile?.agent_kind === "openhands" &&
         resolvedAgentProfile.llm_profile_ref
@@ -189,7 +189,7 @@ export const useCreateConversation = () => {
               `LLM profile "${resolvedAgentProfile.llm_profile_ref}"; ` +
               "launching from agent_settings instead.",
           );
-          effectiveAgentProfileId = undefined;
+          prefersAgentSettingsFallback = true;
         } else if (
           !isCloud &&
           !agentProfileId &&
@@ -210,7 +210,75 @@ export const useCreateConversation = () => {
           // apply to this launch; the start request has no per-launch LLM
           // override that could preserve it (AgentLaunchAdditions carries only
           // a system-message suffix).
-          effectiveAgentProfileId = undefined;
+          prefersAgentSettingsFallback = true;
+        }
+      }
+
+      // A legacy agent_settings launch carries no profile identity, so Agent
+      // Server cannot enforce that profile's secret allow-list. Keep restricted
+      // profiles on the server-resolved path even when one of the compatibility
+      // fallbacks above would otherwise apply. If the detail cannot be read,
+      // fail closed by preserving the profile id and letting Agent Server return
+      // the underlying profile-resolution error.
+      let profileAllowsAgentSettingsFallback = true;
+      if (prefersAgentSettingsFallback && resolvedAgentProfile) {
+        try {
+          // Revalidate stale cached details: policy may have changed since the
+          // profile editor or another client last populated this query.
+          const detail = await queryClient.fetchQuery({
+            queryKey: AGENT_PROFILES_QUERY_KEYS.detail(
+              backend.id,
+              orgId,
+              resolvedAgentProfile.name,
+            ),
+            queryFn: () =>
+              AgentProfilesService.getProfile(resolvedAgentProfile.name),
+            ...AGENT_PROFILES_RETRY_OPTIONS,
+          });
+          const secretRefs = (detail.profile as { secret_refs?: unknown })
+            .secret_refs;
+          profileAllowsAgentSettingsFallback = !Array.isArray(secretRefs);
+        } catch {
+          profileAllowsAgentSettingsFallback = false;
+        }
+      }
+      const effectiveAgentProfileId =
+        prefersAgentSettingsFallback && profileAllowsAgentSettingsFallback
+          ? undefined
+          : requestedAgentProfileId;
+
+      // Profile summaries omit ``acp_server``. Fetch the ACP profile detail
+      // so the Claude skill overlay can tell Claude Code from Codex/custom
+      // without launching the wrong overlay (#16905). Failures are ignored:
+      // conversation start must not block on a detail lookup.
+      let agentProfileAcpServer: string | null | undefined;
+      let agentProfileAcpCommand: string | readonly string[] | null | undefined;
+      if (
+        !isCloud &&
+        effectiveAgentProfileId &&
+        resolvedAgentProfile?.agent_kind === "acp"
+      ) {
+        try {
+          const detail = await queryClient.ensureQueryData({
+            queryKey: AGENT_PROFILES_QUERY_KEYS.detail(
+              backend.id,
+              orgId,
+              resolvedAgentProfile.name,
+            ),
+            queryFn: () =>
+              AgentProfilesService.getProfile(resolvedAgentProfile.name),
+            ...AGENT_PROFILES_RETRY_OPTIONS,
+          });
+          const profile = detail?.profile;
+          if (profile?.agent_kind === "acp") {
+            agentProfileAcpServer = profile.acp_server ?? null;
+            agentProfileAcpCommand = profile.acp_command ?? null;
+          }
+        } catch {
+          console.warn(
+            `Could not load ACP profile "${resolvedAgentProfile.name}" ` +
+              "for Canvas skill projection; launching without the overlay.",
+          );
         }
       }
 
@@ -237,6 +305,8 @@ export const useCreateConversation = () => {
             ? {
                 agentProfileId: effectiveAgentProfileId,
                 agentProfileKind: resolvedAgentProfile?.agent_kind,
+                agentProfileAcpServer,
+                agentProfileAcpCommand,
               }
             : {}),
         });
