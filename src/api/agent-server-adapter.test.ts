@@ -197,6 +197,39 @@ describe("buildStartConversationRequest", () => {
     expect(payload.parent_conversation_id).toBe("parent-1");
   });
 
+  it("requests DockerExecutionWorkspace for the planner on Docker execution servers", () => {
+    const payload = buildStartPlanningConversationRequest({
+      encryptedAgentSettings: {
+        agent_kind: "openhands",
+        llm: { model: "openhands/minimax-m2.7" },
+      },
+      workingDir: "/workspace",
+      parentConversationId: "parent-1",
+      executionRuntime: "docker",
+    });
+
+    expect(payload.workspace).toEqual({
+      kind: "DockerExecutionWorkspace",
+      working_dir: "/workspace",
+    });
+  });
+
+  it("defaults the planner to LocalWorkspace when executionRuntime is not docker", () => {
+    const payload = buildStartPlanningConversationRequest({
+      encryptedAgentSettings: {
+        agent_kind: "openhands",
+        llm: { model: "openhands/minimax-m2.7" },
+      },
+      workingDir: "/host/workspace/project",
+      parentConversationId: "parent-1",
+    });
+
+    expect(payload.workspace).toEqual({
+      kind: "LocalWorkspace",
+      working_dir: "/host/workspace/project",
+    });
+  });
+
   it("defaults the planner's max_iterations to 500 when not provided", () => {
     const payload = buildStartPlanningConversationRequest({
       encryptedAgentSettings: {
@@ -399,6 +432,34 @@ describe("buildStartConversationRequest", () => {
     expect(getAgentContextSkillNames(payload)).toContain(
       "slack-standup-digest",
     );
+  });
+});
+
+describe("buildStartConversationRequest — execution runtime", () => {
+  it("requests DockerExecutionWorkspace from Docker execution servers", () => {
+    const payload = buildStartConversationRequest({
+      settings: makeSettings({ agent_kind: "openhands" }),
+      workingDir: "/host/workspace",
+      executionRuntime: "docker",
+    });
+
+    expect(payload.workspace).toEqual({
+      kind: "DockerExecutionWorkspace",
+      working_dir: "/workspace",
+    });
+    expect(payload.worktree).toBe(false);
+  });
+
+  it("keeps LocalWorkspace for local and older servers", () => {
+    const payload = buildStartConversationRequest({
+      settings: makeSettings({ agent_kind: "openhands" }),
+      workingDir: "/host/workspace",
+    });
+
+    expect(payload.workspace).toEqual({
+      kind: "LocalWorkspace",
+      working_dir: "/host/workspace",
+    });
   });
 });
 
@@ -621,6 +682,33 @@ describe("buildStartPlanningConversationRequestWithEncryptedSettings", () => {
     expect(skillNames).not.toContain("agent-memory");
     expect(skillNames).toContain("add-javadoc");
   });
+
+  it("threads executionRuntime through to DockerExecutionWorkspace selection", async () => {
+    const payload =
+      await buildStartPlanningConversationRequestWithEncryptedSettings({
+        workingDir: "/workspace",
+        parentConversationId: "parent-1",
+        executionRuntime: "docker",
+      });
+
+    expect(payload.workspace).toEqual({
+      kind: "DockerExecutionWorkspace",
+      working_dir: "/workspace",
+    });
+  });
+
+  it("defaults to LocalWorkspace when executionRuntime is not provided", async () => {
+    const payload =
+      await buildStartPlanningConversationRequestWithEncryptedSettings({
+        workingDir: "/host/workspace/project",
+        parentConversationId: "parent-1",
+      });
+
+    expect(payload.workspace).toEqual({
+      kind: "LocalWorkspace",
+      working_dir: "/host/workspace/project",
+    });
+  });
 });
 
 describe("buildStartConversationRequest — agentProfileId path", () => {
@@ -700,5 +788,100 @@ describe("buildStartConversationRequest — agentProfileId path", () => {
     });
 
     expect(payload.secrets_encrypted).toBeUndefined();
+  });
+});
+
+describe("buildStartConversationRequest — Claude ACP skill overlay (#16905)", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  it("appends enabled catalog skill instructions on a Claude profile launch", () => {
+    const settings = makeSettings({
+      agent_kind: "acp",
+      acp_server: "codex",
+      acp_command: ["codex-acp"],
+    });
+    settings.enabled_skills = ["openhands-automation"];
+
+    const payload = buildStartConversationRequest({
+      settings,
+      agentProfileId: "profile-claude",
+      agentProfileKind: "acp",
+      agentProfileAcpServer: "claude-code",
+      agentProfileAcpCommand: [
+        "npx",
+        "-y",
+        "@agentclientprotocol/claude-agent-acp@0.63.0",
+      ],
+    });
+
+    expect(payload.agent_profile_id).toBe("profile-claude");
+    expect(payload.agent_settings).toBeUndefined();
+    const suffix = payload.agent_launch_additions?.system_message_suffix_append;
+    expect(suffix).toContain("# OpenHands Automations");
+    expect(suffix).toContain("CANVAS_ENABLED_SKILLS");
+  });
+
+  it("omits the overlay when openhands-automation is disabled", () => {
+    const settings = makeSettings({
+      agent_kind: "acp",
+      acp_server: "claude-code",
+      acp_command: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+    });
+    settings.enabled_skills = ["add-skill"];
+    settings.disabled_skills = ["openhands-automation"];
+
+    const payload = buildStartConversationRequest({
+      settings,
+      agentProfileId: "profile-claude",
+      agentProfileKind: "acp",
+      agentProfileAcpServer: "claude-code",
+    });
+
+    expect(
+      payload.agent_launch_additions?.system_message_suffix_append ?? "",
+    ).not.toContain("# OpenHands Automations");
+  });
+
+  it("does not attach the overlay to Codex or OpenHands profile launches", () => {
+    const acpSettings = makeSettings({
+      agent_kind: "acp",
+      acp_server: "codex",
+      acp_command: ["codex-acp"],
+    });
+    acpSettings.enabled_skills = ["openhands-automation"];
+
+    const codexPayload = buildStartConversationRequest({
+      settings: acpSettings,
+      agentProfileId: "profile-codex",
+      agentProfileKind: "acp",
+      agentProfileAcpServer: "codex",
+    });
+    expect(codexPayload.agent_launch_additions).toBeUndefined();
+
+    const openHandsPayload = buildStartConversationRequest({
+      settings: makeSettings({
+        agent_kind: "openhands",
+        llm: { model: "litellm_proxy/openai/gpt-5.5", api_key: "sk-test" },
+      }),
+      agentProfileId: "profile-oh",
+      agentProfileKind: "openhands",
+    });
+    expect(openHandsPayload.agent_launch_additions).toBeUndefined();
+  });
+
+  it("attaches the overlay on an inline Claude agent_settings launch", () => {
+    const settings = makeSettings({
+      agent_kind: "acp",
+      acp_server: "claude-code",
+      acp_command: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+    });
+    settings.enabled_skills = ["openhands-automation"];
+
+    const payload = buildStartConversationRequest({ settings });
+    expect(
+      payload.agent_launch_additions?.system_message_suffix_append,
+    ).toContain("# OpenHands Automations");
   });
 });
